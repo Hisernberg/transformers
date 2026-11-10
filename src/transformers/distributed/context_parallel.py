@@ -24,8 +24,11 @@ A context parallel plan pairs two styles:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import partial
 from typing import TYPE_CHECKING
 
+from ..loss.loss_utils import LOSS_MAPPING, ForCausalLMLoss
 from ..utils.generic import GeneralInterface
 from ..utils.import_utils import is_torch_available, is_torch_distributed_available
 from .parallel_utils import ALL_PARALLEL_STYLES
@@ -190,3 +193,109 @@ class AttentionContextParallel:
 if is_torch_distributed_available():
     ALL_PARALLEL_STYLES.register("cp_split_sequence", SplitSequenceParallel())
     ALL_PARALLEL_STYLES.register("cp_attention", AttentionContextParallel())
+
+
+# Layer types that only mix tokens through softmax attention over the whole sequence. Every other one (recurrent,
+# convolutional, sparse-indexer, ...) mixes tokens outside attention and would silently be cut at the slice boundaries.
+SOFTMAX_ATTENTION_LAYER_TYPES = ("full_attention", "sliding_attention", "chunked_attention")
+
+
+def check_context_parallelism(model: nn.Module) -> None:
+    """Raise a `ValueError` if context parallelism would silently change the logits or the loss of `model`."""
+    if not model._supports_attention_backend:
+        raise ValueError(
+            f"Context parallelism routes attention through `ALL_ATTENTION_FUNCTIONS`, but {model.__class__.__name__} "
+            "does not declare that all its attention layers go through it with the model's kwargs "
+            "(`_supports_attention_backend`), so they could run on this rank's slice only. Use another model, or "
+            "disable context parallelism."
+        )
+
+    if model._is_stateful:
+        raise ValueError(
+            f"Context parallelism does not support {model.__class__.__name__}: its recurrent layers carry a state "
+            "along the sequence, so they would run on this rank's slice only and be silently cut at the slice "
+            "boundaries. Use another model, or disable context parallelism."
+        )
+
+    layer_types = set(getattr(model.config.get_text_config(), "layer_types", None) or ())
+    if unsupported := layer_types - set(SOFTMAX_ATTENTION_LAYER_TYPES):
+        raise ValueError(
+            f"Context parallelism does not support the {sorted(unsupported)} layers of {model.__class__.__name__}: "
+            "they mix tokens outside softmax attention, so they would run on this rank's slice only and be silently "
+            "cut at the slice boundaries. Use another model, or disable context parallelism."
+        )
+
+    # `loss_type=None` (base models, and heads whose name maps to no loss) falls back to the causal LM loss
+    if model.loss_type is not None and LOSS_MAPPING.get(model.loss_type) is not ForCausalLMLoss:
+        raise ValueError(
+            f"Context parallelism only supports the causal language modeling loss, but {model.__class__.__name__} "
+            f"uses `loss_type={model.loss_type}`. Its loss would be computed from this rank's slice of the shifted "
+            "labels while the logits stay sharded. Use a `*ForCausalLM` model, or disable context parallelism."
+        )
+
+
+# The two styles a context parallel plan pairs up: the decoder layers keep a slice, their attention sees everything.
+ALL_CP_STYLES = ("cp_split_sequence", "cp_attention")
+
+
+def context_parallel_pre_forward(module: nn.Module, args: tuple, kwargs: dict):
+    """Forward pre-hook of the model: refuse a cache, which context parallelism does not split."""
+    if kwargs.get("past_key_values") is not None:
+        raise ValueError(
+            "Context parallelism only supports training: `past_key_values` are not allowed. Run the model on full "
+            "sequences without a cache, or disable context parallelism."
+        )
+    kwargs["use_cache"] = False
+    # a hub kernel loaded since may have registered another function under the attention key
+    wrap_attention_function(module.config._attn_implementation)
+    return args, kwargs
+
+
+def context_parallel_loss(
+    loss_function: Callable,
+    cp_mesh: DeviceMesh,
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    vocab_size: int,
+    num_items_in_batch: torch.Tensor | None = None,
+    **kwargs,
+) -> torch.Tensor:
+    """
+    The loss of the whole sequences, which every rank reports, from this rank's slice of the logits and its slice of
+    the shifted labels. Its gradient stays this rank's, multiplied by `cp_size`, so that FSDP2's average over the cp
+    ranks gives the gradient of the full-sequence loss.
+    """
+    shift_labels = kwargs.pop("shift_labels", None)
+    if shift_labels is None:
+        shift_labels = torch.nn.functional.pad(labels[..., 1:], (0, 1), value=-100)
+    if num_items_in_batch is None:
+        num_items_in_batch = (shift_labels != -100).sum()
+    kwargs["shift_labels"] = split_sequence(shift_labels, 1, cp_mesh)
+    loss = loss_function(logits, labels, vocab_size, num_items_in_batch=num_items_in_batch, **kwargs)
+
+    total = loss.detach().clone()
+    dist.all_reduce(total, group=cp_mesh.get_group())
+    return total + (loss - loss.detach()) * cp_mesh.size()
+
+
+def apply_context_parallelism(
+    model: nn.Module, cp_mesh: DeviceMesh, cp_plan: dict[str, str], cp_implementation: str = "ulysses"
+) -> nn.Module:
+    """
+    Let the ranks of `cp_mesh` split every sequence: the plan's `"cp_split_sequence"` decoder layers run on this rank's
+    slice, and its `"cp_attention"` modules run their attention through `cp_implementation`. A forward pre-hook refuses
+    a cache, and `model.loss_function` returns the loss of the whole sequences.
+    """
+    check_context_parallelism(model)
+    modules = dict(model.named_modules())
+    # the first decoder layer still gets the whole sequence: it is the one that cuts it
+    first_layer = next(name for name, style in cp_plan.items() if style == "cp_split_sequence")
+    for name, style in cp_plan.items():
+        if style == "cp_split_sequence":
+            ALL_PARALLEL_STYLES[style].install_forward(modules[name], cp_mesh, split_hidden_states=name == first_layer)
+        else:
+            ALL_PARALLEL_STYLES[style].install_forward(modules[name], cp_mesh, cp_implementation=cp_implementation)
+
+    model.register_forward_pre_hook(context_parallel_pre_forward, with_kwargs=True)
+    model.loss_function = partial(context_parallel_loss, model.loss_function, cp_mesh)
+    return model
