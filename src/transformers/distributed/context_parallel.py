@@ -243,8 +243,17 @@ def check_context_parallelism(model: nn.Module) -> None:
 ALL_CP_STYLES = ("cp_split_sequence", "cp_attention")
 
 
-def context_parallel_pre_forward(module: nn.Module, args: tuple, kwargs: dict):
-    """Forward pre-hook of the model: refuse a cache, which context parallelism does not split."""
+def pad_sequence(tensor: torch.Tensor, pad_len: int, value) -> torch.Tensor:
+    """`tensor` with `pad_len` copies of `value` appended along its sequence dimension 1."""
+    padding = tensor.new_full((tensor.shape[0], pad_len, *tensor.shape[2:]), value)
+    return torch.cat([tensor, padding], dim=1)
+
+
+def context_parallel_pre_forward(module: nn.Module, args: tuple, kwargs: dict, *, cp_mesh: DeviceMesh):
+    """
+    Forward pre-hook of the model: refuse a cache, which context parallelism does not split, and pad every sequence at
+    the end to a multiple of `cp_size`, before the model builds its masks from them.
+    """
     if kwargs.get("past_key_values") is not None:
         raise ValueError(
             "Context parallelism only supports training: `past_key_values` are not allowed. Run the model on full "
@@ -253,6 +262,32 @@ def context_parallel_pre_forward(module: nn.Module, args: tuple, kwargs: dict):
     kwargs["use_cache"] = False
     # a hub kernel loaded since may have registered another function under the attention key
     wrap_attention_function(module.config._attn_implementation)
+
+    tokens = args[0] if args else kwargs.get("input_ids")
+    if tokens is None:
+        tokens = kwargs["inputs_embeds"]
+    pad_len = -tokens.shape[1] % cp_mesh.size()
+    if pad_len == 0:
+        return args, kwargs
+
+    pad_token_id = getattr(module.config, "pad_token_id", None) or 0
+    if args:
+        args = (pad_sequence(args[0], pad_len, pad_token_id),) + args[1:]
+    padding_values = {
+        "input_ids": pad_token_id,
+        "inputs_embeds": 0,
+        "attention_mask": 0,
+        "labels": -100,
+        "shift_labels": -100,
+    }
+    for name, value in padding_values.items():
+        if kwargs.get(name) is not None:
+            kwargs[name] = pad_sequence(kwargs[name], pad_len, value)
+    if kwargs.get("position_ids") is not None:
+        # the padding continues the positions of the last document of every row
+        position_ids = kwargs["position_ids"]
+        steps = torch.arange(1, pad_len + 1, device=position_ids.device)
+        kwargs["position_ids"] = torch.cat([position_ids, position_ids[..., -1:] + steps], dim=-1)
     return args, kwargs
 
 
@@ -289,7 +324,8 @@ def apply_context_parallelism(
     """
     Let the ranks of `cp_mesh` split every sequence: the plan's `"cp_split_sequence"` decoder layers run on this rank's
     slice, and its `"cp_attention"` modules run their attention through `cp_implementation`. A forward pre-hook refuses
-    a cache, and `model.loss_function` returns the loss of the whole sequences.
+    a cache and pads the sequences to a multiple of `cp_size`, and `model.loss_function` returns the loss of the whole
+    sequences.
     """
     check_context_parallelism(model)
     modules = dict(model.named_modules())
@@ -301,6 +337,6 @@ def apply_context_parallelism(
         else:
             ALL_PARALLEL_STYLES[style].install_forward(modules[name], cp_mesh, cp_implementation=cp_implementation)
 
-    model.register_forward_pre_hook(context_parallel_pre_forward, with_kwargs=True)
+    model.register_forward_pre_hook(partial(context_parallel_pre_forward, cp_mesh=cp_mesh), with_kwargs=True)
     model.loss_function = partial(context_parallel_loss, model.loss_function, cp_mesh)
     return model
